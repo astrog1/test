@@ -1,0 +1,569 @@
+# sudoku_game_fixed.py
+import os
+import random
+from datetime import timedelta
+from flask import Flask, render_template_string, request, jsonify, session
+
+app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-change-me")
+app.permanent_session_lifetime = timedelta(days=7)
+
+# ---------------------------
+# Sudoku engine
+# ---------------------------
+SIZE = 9
+BOX = 3
+NUMS = list(range(1, SIZE + 1))
+
+
+def find_empty(board):
+    for r in range(SIZE):
+        for c in range(SIZE):
+            if board[r][c] == 0:
+                return r, c
+    return None
+
+
+def valid(board, r, c, val):
+    # row
+    if any(board[r][x] == val for x in range(SIZE)):
+        return False
+    # col
+    if any(board[x][c] == val for x in range(SIZE)):
+        return False
+    # box
+    br = (r // BOX) * BOX
+    bc = (c // BOX) * BOX
+    for i in range(br, br + BOX):
+        for j in range(bc, bc + BOX):
+            if board[i][j] == val:
+                return False
+    return True
+
+
+def is_placeable(board, r, c, val):
+    if val == 0:
+        return True
+    # Ignore current cell value while checking
+    original = board[r][c]
+    board[r][c] = 0
+    ok = valid(board, r, c, val)
+    board[r][c] = original
+    return ok
+
+
+def solve(board):
+    loc = find_empty(board)
+    if not loc:
+        return True
+    r, c = loc
+    for val in NUMS:
+        if valid(board, r, c, val):
+            board[r][c] = val
+            if solve(board):
+                return True
+            board[r][c] = 0
+    return False
+
+
+def count_solutions(board, limit=2):
+    """Backtracking count with early exit if > limit (enforce uniqueness)."""
+    tmp = [row[:] for row in board]
+    solutions = 0
+
+    def backtrack():
+        nonlocal solutions
+        if solutions >= limit:
+            return
+        loc = find_empty(tmp)
+        if not loc:
+            solutions += 1
+            return
+        r, c = loc
+        for val in NUMS:
+            if valid(tmp, r, c, val):
+                tmp[r][c] = val
+                backtrack()
+                tmp[r][c] = 0
+                if solutions >= limit:
+                    return
+
+    backtrack()
+    return solutions
+
+
+def generate_full_board():
+    board = [[0] * SIZE for _ in range(SIZE)]
+
+    # Fill diagonal boxes to speed solving
+    def fill_box(start_r, start_c):
+        nums = NUMS[:]
+        random.shuffle(nums)
+        idx = 0
+        for i in range(start_r, start_r + BOX):
+            for j in range(start_c, start_c + BOX):
+                board[i][j] = nums[idx]
+                idx += 1
+
+    for d in range(0, SIZE, BOX):
+        fill_box(d, d)
+
+    solve(board)
+    return board
+
+
+def make_puzzle(difficulty="medium"):
+    # Target clue counts by difficulty (rough)
+    targets = {
+        "easy": random.randint(36, 45),
+        "medium": random.randint(30, 35),
+        "hard": random.randint(26, 29),
+        "evil": random.randint(22, 25),
+    }
+    target_clues = targets.get(difficulty, targets["medium"])
+
+    full = generate_full_board()
+    puzzle = [row[:] for row in full]
+
+    cells = [(r, c) for r in range(SIZE) for c in range(SIZE)]
+    random.shuffle(cells)
+
+    def clues_count(b):
+        return sum(1 for r in range(SIZE) for c in range(SIZE) if b[r][c] != 0)
+
+    for r, c in cells:
+        if puzzle[r][c] == 0:
+            continue
+        val = puzzle[r][c]
+        sym_r, sym_c = SIZE - 1 - r, SIZE - 1 - c
+        val2 = puzzle[sym_r][sym_c]
+
+        puzzle[r][c] = 0
+        if (r, c) != (sym_r, sym_c):
+            puzzle[sym_r][sym_c] = 0
+
+        if clues_count(puzzle) < target_clues:
+            # went under target; restore
+            puzzle[r][c] = val
+            if (r, c) != (sym_r, sym_c):
+                puzzle[sym_r][sym_c] = val2
+            continue
+
+        # enforce unique solution
+        if count_solutions(puzzle) != 1:
+            puzzle[r][c] = val
+            if (r, c) != (sym_r, sym_c):
+                puzzle[sym_r][sym_c] = val2
+
+    solution = [row[:] for row in full]
+    return puzzle, solution
+
+
+# ---------------------------
+# Session helpers & routes
+# ---------------------------
+
+def new_game(difficulty="medium"):
+    puzzle, solution = make_puzzle(difficulty)
+    session["puzzle"] = puzzle
+    session["solution"] = solution
+    session["given"] = [[1 if puzzle[r][c] != 0 else 0 for c in range(SIZE)] for r in range(SIZE)]
+    session["notes"] = [[[] for _ in range(SIZE)] for _ in range(SIZE)]
+    session.permanent = True
+
+
+# Use app.route for maximal Flask compatibility (older Flask may not have app.get/app.post)
+@app.route("/", methods=["GET"])  # was @app.get("/")
+def index():
+    if "puzzle" not in session:
+        new_game("medium")
+    return render_template_string(TEMPLATE, size=SIZE)
+
+
+@app.route("/api/new", methods=["POST"])  # was @app.post
+def api_new():
+    data = request.get_json(silent=True) or {}
+    difficulty = data.get("difficulty", "medium")
+    if difficulty not in ("easy", "medium", "hard", "evil"):
+        difficulty = "medium"
+    new_game(difficulty)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/state", methods=["GET"])  # was @app.get
+def api_state():
+    puzzle = session.get("puzzle")
+    given = session.get("given")
+    if not puzzle:
+        new_game("medium")
+        puzzle = session.get("puzzle")
+        given = session.get("given")
+    return jsonify({"puzzle": puzzle, "given": given})
+
+
+@app.route("/api/place", methods=["POST"])  # was @app.post
+def api_place():
+    """
+    Places a value if it's *placeable* (no conflict in row/col/box), regardless of final correctness.
+    v=0 clears the cell.
+    Response: { ok, placeable, placed }
+    """
+    data = request.get_json(silent=True) or {}
+    r, c, v = data.get("r"), data.get("c"), data.get("v")
+    puzzle = session.get("puzzle")
+    given = session.get("given")
+    if puzzle is None or given is None:
+        return jsonify({"ok": False, "error": "no game"}), 400
+
+    if any(x is None for x in (r, c, v)) or not (0 <= r < SIZE and 0 <= c < SIZE and 0 <= v <= 9):
+        return jsonify({"ok": False, "error": "bad input"}), 400
+    if given[r][c] == 1:
+        return jsonify({"ok": False, "error": "Given cell"}), 400
+
+    if v == 0:
+        puzzle[r][c] = 0
+        session["puzzle"] = puzzle
+        return jsonify({"ok": True, "placeable": True, "placed": True})
+
+    if is_placeable(puzzle, r, c, v):
+        puzzle[r][c] = v
+        session["puzzle"] = puzzle
+        return jsonify({"ok": True, "placeable": True, "placed": True})
+    else:
+        return jsonify({"ok": True, "placeable": False, "placed": False})
+
+
+@app.route("/api/solve", methods=["POST"])  # was @app.post
+def api_solve():
+    solution = session.get("solution")
+    if not solution:
+        return jsonify({"ok": False}), 400
+    return jsonify({"ok": True, "solution": solution})
+
+
+@app.route("/api/hint", methods=["POST"])  # was @app.post
+def api_hint():
+    solution = session.get("solution")
+    puzzle = session.get("puzzle")
+    if not solution or not puzzle:
+        return jsonify({"ok": False}), 400
+    empties = [(r, c) for r in range(SIZE) for c in range(SIZE) if puzzle[r][c] == 0]
+    if not empties:
+        return jsonify({"ok": False})
+    r, c = random.choice(empties)
+    val = solution[r][c]
+    puzzle[r][c] = val
+    session["puzzle"] = puzzle
+    return jsonify({"ok": True, "r": r, "c": c, "v": val})
+
+
+# ---------------------------
+# HTML / CSS / JS (inline)
+# ---------------------------
+TEMPLATE = r"""
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Sudoku</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='0.9em' font-size='90'>🧩</text></svg>">
+  <style>
+    :root {
+      --bg: #ffffff; --fg: #111111; --muted: #666; --card: #f7f7f8; --accent: #0ea5e9; --grid: #d1d5db; --grid-bold: #9ca3af; --error: #ef4444; --ok: #22c55e; --cell-bg: #ffffff; --cell-hover: #e5f6ff; --shadow: 0 10px 30px rgba(0,0,0,0.08);
+    }
+    @media (prefers-color-scheme: dark) {
+      :root { --bg:#0b0f14; --fg:#e5e7eb; --muted:#9ca3af; --card:#111827; --accent:#38bdf8; --grid:#374151; --grid-bold:#4b5563; --error:#f87171; --ok:#4ade80; --cell-bg:#0b0f14; --cell-hover:#0b2533; --shadow:0 10px 30px rgba(0,0,0,0.4); }
+    }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, "Helvetica Neue", Arial; background: radial-gradient(1200px 800px at 20% -10%, rgba(56,189,248,0.08), transparent 60%), radial-gradient(1000px 700px at 120% 10%, rgba(16,185,129,0.08), transparent 60%), var(--bg); color: var(--fg); min-height: 100svh; display:flex; align-items:center; justify-content:center; padding: 24px; }
+    .wrap { width: min(1100px, 100%); display:grid; grid-template-columns: 1fr 360px; gap: 24px; align-items:start; }
+    @media (max-width: 1000px){ .wrap { grid-template-columns: 1fr; padding-bottom: 110px; } }
+    .card { background: var(--card); border-radius: 20px; box-shadow: var(--shadow); padding: 18px; }
+    .title { display:flex; align-items:center; justify-content:space-between; gap: 12px; margin-bottom: 14px; }
+    .title h1 { font-size: 22px; margin: 0; letter-spacing: 0.3px; }
+    .controls { display:flex; flex-wrap:wrap; gap: 8px; }
+    button, select { background: var(--bg); color: var(--fg); border: 1px solid var(--grid); padding: 10px 12px; border-radius: 10px; cursor: pointer; font-weight: 600; transition: transform .02s ease; }
+    button:hover { transform: translateY(-1px); }
+    .btn-on { outline: 2px solid var(--accent); }
+
+    .grid { aspect-ratio: 1/1; width: min(92vw, 560px); max-width: 560px; background: var(--cell-bg); border-radius: 16px; overflow: hidden; border: 1px solid var(--grid); display:grid; grid-template-columns: repeat(9, 1fr); grid-template-rows: repeat(9, 1fr); touch-action: manipulation; margin-top:8px; }
+    .cell { border-right: 1px solid var(--grid); border-bottom: 1px solid var(--grid); display:flex; align-items:center; justify-content:center; font-size: 22px; font-weight: 700; position: relative; user-select: none; -webkit-user-select: none; transition: background .12s ease; }
+    .cell:hover { background: var(--cell-hover); }
+    .cell.given { background: linear-gradient(180deg, rgba(56,189,248,0.08), transparent 60%); }
+    .cell.err { background: linear-gradient(180deg, rgba(239,68,68,0.12), transparent 60%); }
+    .cell.selected { box-shadow: inset 0 0 0 3px var(--accent); z-index:1; }
+
+    /* bold lines for 3x3 boxes */
+    .cell:nth-child(9n+3), .cell:nth-child(9n+6) { border-right: 2px solid var(--grid-bold); }
+    .cell:nth-child(n+73) { border-bottom: 0; }
+    .cell-box-bottom { border-bottom: 2px solid var(--grid-bold) !important; }
+
+    /* Pencil notes */
+    .notes { width:100%; height:100%; display:grid; grid-template-columns: repeat(3,1fr); grid-template-rows: repeat(3,1fr); gap: 1px; padding:4px; }
+    .note { font-size: 10px; line-height: 1; opacity:.8; display:flex; align-items:center; justify-content:center; }
+
+    /* NUMPAD: right of board on wide screens; docks to bottom on small screens */
+    .numpad { display:grid; grid-template-columns: repeat(3, 1fr); gap:10px; }
+    .nkey { padding: 14px 0; font-weight:800; border-radius:12px; border:1px solid var(--grid); background: var(--bg); text-align:center; }
+    .nkey:active { transform: scale(.98); }
+    .nkey.clear { grid-column: span 3; }
+
+    @media (max-width: 1000px){
+      /* turn it into a bottom dock for iPad/phones */
+      .numpad-wrap { position: fixed; left: 50%; transform: translateX(-50%); bottom: 12px; width: min(560px, 92svw); background: var(--card); border:1px solid var(--grid); box-shadow: var(--shadow); border-radius:16px; padding:10px; }
+      .numpad { grid-template-columns: repeat(5, 1fr); }
+      .nkey.clear { grid-column: span 2; }
+    }
+
+    .side { display:grid; gap: 12px; align-content:start; }
+    .info { display:flex; gap: 10px; align-items:center; }
+    .badge { padding: 6px 10px; border-radius: 999px; border: 1px solid var(--grid); font-weight: 700; font-size: 12px; }
+    .timer { font-variant: tabular-nums; letter-spacing: 0.5px; }
+    .kbd { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas; font-weight:700; font-size:12px; padding:2px 6px; border: 1px solid var(--grid); border-radius:6px; }
+    .footer { opacity:.8; font-size:12px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <div class="title">
+        <h1>Sudoku</h1>
+        <div class="controls">
+          <select id="difficulty" aria-label="Difficulty">
+            <option value="easy">Easy</option>
+            <option value="medium" selected>Medium</option>
+            <option value="hard">Hard</option>
+            <option value="evil">Evil</option>
+          </select>
+          <button id="newBtn">New Game</button>
+          <button id="hintBtn">Hint</button>
+          <button id="solveBtn">Solve</button>
+          <button id="pencilBtn" aria-pressed="false">Notes ✏️</button>
+        </div>
+      </div>
+      <div id="grid" class="grid" role="grid" aria-label="Sudoku grid"></div>
+    </div>
+
+    <div class="side">
+      <!-- NUMPAD ON THE RIGHT -->
+      <div class="card numpad-wrap">
+        <div class="numpad" id="numpad" aria-label="Number pad">
+          <button class="nkey" data-k="1">1</button>
+          <button class="nkey" data-k="2">2</button>
+          <button class="nkey" data-k="3">3</button>
+          <button class="nkey" data-k="4">4</button>
+          <button class="nkey" data-k="5">5</button>
+          <button class="nkey" data-k="6">6</button>
+          <button class="nkey" data-k="7">7</button>
+          <button class="nkey" data-k="8">8</button>
+          <button class="nkey" data-k="9">9</button>
+          <button class="nkey clear" data-k="C">Clear</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="info">
+          <div class="badge" id="status">Ready</div>
+          <div class="timer" id="timer">00:00</div>
+        </div>
+        <p style="margin:8px 0 0 0; opacity:.9">Tap a cell then use the number pad. Toggle <strong>Notes</strong> to pencil in candidates. <span class="kbd">Clear</span> removes value/notes.</p>
+      </div>
+      <div class="card footer">
+        <div>Made with Flask. Theme follows your system setting (light/dark).</div>
+      </div>
+    </div>
+  </div>
+
+<script>
+let size = {{ size }};
+let puzzle = Array.from({length:size}, ()=> Array(size).fill(0));
+let given  = Array.from({length:size}, ()=> Array(size).fill(0));
+let notes  = Array.from({length:size}, ()=> Array.from({length:size}, ()=>[]));
+let startTs = Date.now();
+let timerId = null;
+let selected = null; // {r,c}
+let pencilMode = false;
+
+function fmtTime(s){ const m = Math.floor(s/60); const ss = (s%60).toString().padStart(2,'0'); return `${m.toString().padStart(2,'0')}:${ss}` }
+function startTimer(){ if(timerId) clearInterval(timerId); startTs = Date.now(); timerId = setInterval(()=>{ const s = Math.floor((Date.now()-startTs)/1000); document.getElementById('timer').textContent = fmtTime(s); }, 1000); }
+function setStatus(msg){ document.getElementById('status').textContent = msg; }
+
+function skeletonGrid(){
+  const g = document.getElementById('grid'); g.innerHTML = '';
+  for(let r=0;r<size;r++){
+    for(let c=0;c<size;c++){
+      const cell = document.createElement('div');
+      cell.className = 'cell' + ((r%3===2)?' cell-box-bottom':'');
+      cell.dataset.r = r; cell.dataset.c = c;
+      cell.addEventListener('click', ()=> selectCell(r,c));
+      g.appendChild(cell);
+    }
+  }
+}
+
+function buildGrid(){
+  const g = document.getElementById('grid'); g.innerHTML = '';
+  for(let r=0;r<size;r++){
+    for(let c=0;c<size;c++){
+      const cell = document.createElement('div');
+      cell.className = 'cell' + ((r%3===2)?' cell-box-bottom':'');
+      cell.dataset.r = r; cell.dataset.c = c;
+
+      if(given[r][c]===1){
+        cell.classList.add('given');
+        cell.textContent = puzzle[r][c];
+      }else{
+        renderEditable(cell, r, c);
+      }
+
+      cell.addEventListener('click', ()=> selectCell(r,c));
+      g.appendChild(cell);
+    }
+  }
+}
+
+function renderEditable(cell, r, c){
+  cell.innerHTML = '';
+  const v = puzzle[r][c];
+  if(v){ cell.textContent = v; return; }
+  if(notes[r][c] && notes[r][c].length){
+    const wrap = document.createElement('div'); wrap.className='notes';
+    for(let i=1;i<=9;i++){
+      const sp = document.createElement('div'); sp.className='note'; sp.textContent = notes[r][c].includes(i)? i : '';
+      wrap.appendChild(sp);
+    }
+    cell.appendChild(wrap);
+  }
+}
+
+function clearSelection(){ document.querySelectorAll('.cell.selected').forEach(el=> el.classList.remove('selected')); }
+function selectCell(r,c){
+  if(given[r][c]===1) return;
+  selected = {r,c}; clearSelection();
+  const idx = r*size + c;
+  const cell = document.querySelectorAll('.cell')[idx];
+  if(cell) cell.classList.add('selected');
+}
+
+async function placeValue(r,c,v){
+  const res = await fetch('/api/place',{method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({r,c,v})});
+  return res.json();
+}
+
+async function handleNumber(k){
+  if(!selected) return;
+  const {r,c} = selected; const idx = r*size + c; const cell = document.querySelectorAll('.cell')[idx];
+  if(!cell) return;
+
+  if(k==='C'){
+    try{
+      const data = await placeValue(r,c,0);
+      if(data.ok){ puzzle[r][c]=0; notes[r][c]=[]; cell.classList.remove('err'); renderEditable(cell,r,c); setStatus('Cleared'); }
+    }catch(e){ setStatus('Can’t reach server'); console.error(e); }
+    return;
+  }
+  const v = parseInt(k,10);
+  if(pencilMode){
+    const arr = notes[r][c]; const i = arr.indexOf(v);
+    if(i>=0) arr.splice(i,1); else arr.push(v);
+    arr.sort((a,b)=>a-b); renderEditable(cell,r,c); return;
+  }
+  try{
+    const data = await placeValue(r,c,v);
+    if(!data.ok){ setStatus(data.error || 'Error'); return; }
+    if(data.placeable){
+      puzzle[r][c]=v; notes[r][c]=[]; cell.classList.remove('err'); cell.textContent=v; setStatus('');
+    } else {
+      cell.classList.add('err'); setStatus('Conflict: row/col/box');
+    }
+  } catch(e){ setStatus('Can’t reach server'); console.error(e); }
+}
+
+async function newGame(){
+  const diff = document.getElementById('difficulty').value;
+  setStatus('Generating…');
+  try{
+    await fetch('/api/new',{method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({difficulty: diff})});
+    await loadState();
+    selected=null;
+  }catch(e){
+    setStatus('Failed to make a new game'); console.error(e);
+  }
+}
+
+async function doHint(){
+  try{
+    const res = await fetch('/api/hint',{method:'POST'});
+    const data = await res.json();
+    if(data.ok){
+      const idx = data.r*size + data.c;
+      const cell = document.querySelectorAll('.cell')[idx];
+      puzzle[data.r][data.c]=data.v; notes[data.r][data.c]=[];
+      if(cell){ cell.textContent = data.v; }
+    }
+  }catch(e){ setStatus('Hint failed'); console.error(e); }
+}
+
+async function doSolve(){
+  try{
+    const res = await fetch('/api/solve',{method:'POST'});
+    const data = await res.json();
+    if(data.ok){
+      puzzle=data.solution;
+      document.querySelectorAll('.cell').forEach((cell,idx)=>{
+        const r=Math.floor(idx/size), c=idx%size;
+        if(given[r][c]!==1){ cell.classList.remove('err'); cell.textContent=puzzle[r][c]; }
+      });
+      setStatus('Solved'); clearInterval(timerId);
+    }
+  }catch(e){ setStatus('Solve failed'); console.error(e); }
+}
+
+async function loadState(){
+  try{
+    const res = await fetch('/api/state');
+    if(!res.ok) throw new Error('Bad response');
+    const data = await res.json();
+    puzzle = data.puzzle || puzzle;
+    given  = data.given  || given;
+    notes  = Array.from({length:size}, ()=> Array.from({length:size}, ()=>[]));
+    buildGrid(); startTimer(); setStatus('Good luck!');
+  }catch(e){
+    setStatus('Could not load game. Check the Flask console for errors.');
+    console.error(e);
+  }
+}
+
+// Wire up UI after DOM is ready
+window.addEventListener('DOMContentLoaded', ()=>{
+  ['newBtn','hintBtn','solveBtn'].forEach(id=>{
+    document.getElementById(id).addEventListener('click', ({target})=>
+      ({newBtn:newGame, hintBtn:doHint, solveBtn:doSolve}[target.id]())
+    );
+  });
+  document.getElementById('pencilBtn').addEventListener('click', (e)=>{
+    pencilMode=!pencilMode; e.currentTarget.classList.toggle('btn-on', pencilMode);
+    e.currentTarget.setAttribute('aria-pressed', pencilMode? 'true':'false');
+    setStatus(pencilMode? 'Notes ON' : 'Notes OFF');
+  });
+  Array.from(document.querySelectorAll('.nkey')).forEach(btn=> btn.addEventListener('click', ()=> handleNumber(btn.dataset.k)));
+  window.addEventListener('keydown', (e)=>{
+    if(!selected) return;
+    if(e.key==='Backspace' || e.key==='Delete'){ handleNumber('C'); }
+    if(/[1-9]/.test(e.key)){ handleNumber(e.key); }
+  });
+
+  // Draw skeleton immediately, then load real state
+  skeletonGrid();
+  loadState();
+});
+</script>
+</body>
+</html>
+"""
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=True)
